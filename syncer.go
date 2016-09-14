@@ -1,31 +1,47 @@
 package syncer
 
+import (
+	"sync"
+)
+
 type Syncer interface {
 	//semaphore Proberen
 	P() bool
 	//semaphore Verhogen
 	V()
 
-	//in theory, callbacks should be careful if including goroutine,
+	//IfOpen executes callback if the syncer is open.
 	//and generally avoid it. This package is about making the caller
 	//a goroutine without risk; not call goroutine inside synced operations
-	IfOpen(Callback, []interface{})
-	IfClosed(Callback, []interface{})
-
-	// a closed syncer cannot be used any more.
-	// if you want to use a syncer with same characteristics, clone it
+	IfOpen(Callback, []interface{}) Syncer
+	IfClosed(Callback, []interface{}) Syncer
+	// Clone makes a copy of Syncer. A closed syncer cannot be used any more.
+	// If you want to use a syncer with same characteristics, clone it
 	Clone() Syncer
-
+	//Open starts the syncer.
+	//Note that, a soon as syncer is created, IfClosed(..) will be able to operate,
+	//even if syncer not started.
+	Open()
+	//Close stops the syncer.
 	Close()
-	Done()
-	DoneChannel() chan struct{}
+	//Done returns when syncer is fully stopped. If called before syncer started,
+	//it will return immdiately.
+	WaitClosed()
+	//Ready blocks, and continues when the syncer has finished Open() operartions.
+	WaitOpened()
+
+	OpenedChannel() chan struct{}
+	ClosedChannel() chan struct{}
 }
-type Callback func(v ...interface{})
+
+type Callback func(v []interface{})
 
 type SyncerImpl struct {
-	poolSize int
-	pool     chan bool
-	done     chan struct{}
+	poolSize  int
+	pool      chan bool
+	done      chan struct{}
+	ready     chan struct{}
+	poolMutex *sync.RWMutex
 }
 
 func NewSyncer(poolSize int) Syncer {
@@ -33,24 +49,50 @@ func NewSyncer(poolSize int) Syncer {
 		poolSize = 1
 	}
 	s := &SyncerImpl{
-		poolSize: poolSize,
-		pool:     make(chan bool, poolSize),
+		poolSize:  poolSize,
+		poolMutex: new(sync.RWMutex),
+		//ready & done are both the intransitive parts of a syncer
+		ready: make(chan struct{}),
+		done:  make(chan struct{}),
 	}
 
-	for i := 0; i < poolSize; i++ {
-		s.pool <- true
-	}
 	return s
 }
 
+func (s *SyncerImpl) Open() {
+	defer close(s.ready)
+	s.poolMutex.Lock()
+	defer s.poolMutex.Unlock()
+
+	s.pool = make(chan bool, s.poolSize)
+	for i := 0; i < s.poolSize; i++ {
+		s.pool <- true
+	}
+}
+
+func (s *SyncerImpl) WaitOpened() {
+	<-s.ready
+}
+
 func (s *SyncerImpl) Close() {
-	go func(poolSize int, pool chan bool, done chan struct{}) {
-		for i := 0; i < poolSize; i++ {
-			<-pool
+	s.poolMutex.RLock()
+	defer s.poolMutex.RUnlock()
+
+	if s.pool == nil {
+		close(s.done)
+		return
+	}
+	go func() {
+		for i := 0; i < s.poolSize; i++ {
+			<-s.pool
 		}
-		close(pool)
-		close(done)
-	}(s.poolSize, s.pool, s.done)
+
+		s.poolMutex.Lock()
+		close(s.pool)
+		s.pool = nil
+		s.poolMutex.Unlock()
+		close(s.done)
+	}()
 }
 
 func (s *SyncerImpl) Clone() Syncer {
@@ -61,21 +103,44 @@ func (s *SyncerImpl) Clone() Syncer {
 	return s2
 }
 
-func (s *SyncerImpl) IfOpen(cb Callback, args []interface{}) {
-	r := s.P()
-	if !r {
-		return
+func (s *SyncerImpl) IfOpen(cb Callback, args []interface{}) Syncer {
+	s.poolMutex.RLock()
+	defer s.poolMutex.RUnlock()
+
+	if s.pool == nil {
+		return s
 	}
+
+	r := s.P()
+	defer s.V()
+
+	if !r {
+		return s
+	}
+
 	cb(args)
-	s.V()
+
+	return s
 }
 
-func (s *SyncerImpl) IfClosed(cb Callback, args []interface{}) {
+func (s *SyncerImpl) IfClosed(cb Callback, args []interface{}) Syncer {
+	s.poolMutex.RLock()
+	defer s.poolMutex.RUnlock()
+
+	if s.pool == nil {
+		cb(args)
+		return s
+	}
+
 	r := s.P()
+	defer s.V()
+
 	if r {
-		return
+		return s
 	}
 	cb(args)
+
+	return s
 }
 
 func (s *SyncerImpl) P() bool {
@@ -86,10 +151,19 @@ func (s *SyncerImpl) V() {
 	s.pool <- true
 }
 
-func (s *SyncerImpl) Done() {
+func (s *SyncerImpl) WaitClosed() {
+	s.poolMutex.RLock()
+	if s.pool == nil {
+		return
+	}
+	s.poolMutex.RUnlock()
 	<-s.done
 }
 
-func (s *SyncerImpl) DoneChannel() chan struct{} {
+func (s *SyncerImpl) ClosedChannel() chan struct{} {
 	return s.done
+}
+
+func (s *SyncerImpl) OpenedChannel() chan struct{} {
+	return s.ready
 }
